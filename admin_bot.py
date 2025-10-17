@@ -508,6 +508,7 @@ async def broadcast_send_all(message: types.Message, state: FSMContext):
                 disable_notification=getattr(config, "SILENT_MODE", False)
             )
             sent += 1
+            await asyncio.sleep(0.05)  # Anti-flood
         except Exception as e:
             logging.error(f"Broadcast failed to {u['user_id']}: {e}")
     
@@ -636,13 +637,7 @@ async def channel_diagnostics(callback: types.CallbackQuery):
         me = await bot.get_me()
         issues.append(f"✅ Бот: @{me.username}")
     except Exception as e:
-        issues.append(f"❌ Ошибка получения info бота: {e}")
-    
-    try:
-        member = await bot.get_chat_member(PRIVATE_CHANNEL_ID, (await bot.get_me()).id)
-        issues.append(f"✅ Бот в канале: {member.status}")
-    except Exception as e:
-        issues.append(f"❌ Ошибка проверки канала: {e}")
+        issues.append(f"❌ Ошибка проверки прав бота: {e}")
     
     await callback.message.edit_text("\n".join(issues), reply_markup=get_admin_keyboard())
 
@@ -657,8 +652,8 @@ async def silent_mode_status(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve_purchase(callback: types.CallbackQuery):
-    """Approve purchase request"""
-    await callback.answer()
+    """Approve purchase request - УЛУЧШЕННАЯ ВЕРСИЯ"""
+    await callback.answer("⏳ Обрабатываю...")
     
     purchase_id = int(callback.data.replace("approve_", ""))
     purchase = await db.get_pending_purchase(purchase_id)
@@ -672,90 +667,92 @@ async def approve_purchase(callback: types.CallbackQuery):
         await callback.message.edit_text("❌ Услуга не найдена")
         return
     
-    end_date = await db.activate_user_subscription(
-        purchase['user_id'],
-        purchase['username'],
-        purchase['phone_number'],
-        service['duration_days'],
-        service.get('duration_unit', 'days')
-    )
-    
-    channel_added = False
-    error_message = None
-    
+    # 1. АКТИВИРУЕМ ПОДПИСКУ В БД
     try:
-        chat_member = await bot.get_chat_member(PRIVATE_CHANNEL_ID, purchase['user_id'])
-        if chat_member.status not in ['left', 'kicked']:
-            channel_added = True
-            logging.info(f"User {purchase['user_id']} already in channel")
-    except:
-        pass
+        end_date = await db.activate_user_subscription(
+            purchase['user_id'],
+            purchase['username'],
+            purchase['phone_number'],
+            service['duration_days'],
+            service.get('duration_unit', 'days')
+        )
+        logging.info(f"✅ Subscription activated for user {purchase['user_id']} until {end_date}")
+    except Exception as e:
+        logging.error(f"❌ Failed to activate subscription: {e}")
+        await callback.message.edit_text(f"❌ Ошибка активации подписки: {e}")
+        return
     
-    if not channel_added:
-        try:
-            await bot.unban_chat_member(PRIVATE_CHANNEL_ID, purchase['user_id'], only_if_banned=True)
-        except:
-            pass
+    # 2. СОЗДАЕМ ПЕРСОНАЛЬНУЮ ССЫЛКУ НА КАНАЛ
+    invite_link = None
+    try:
+        # Проверяем права бота
+        me = await bot.get_me()
+        member = await bot.get_chat_member(PRIVATE_CHANNEL_ID, me.id)
         
-        direct_add_success = False
-        try:
-            result = await bot.add_chat_member(PRIVATE_CHANNEL_ID, purchase['user_id'])
-            direct_add_success = True
-            channel_added = True
-            await db.mark_user_added_to_channel(purchase['user_id'])
-            logging.info(f"User {purchase['user_id']} added directly to channel")
-            
-            await user_sender_bot.send_message(
-                purchase['user_id'],
-                f"✅ <b>Подписка активирована!</b>\n\n"
-                f"Услуга: <b>{service['name']}</b>\n"
-                f"Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n\n"
-                f"Вы автоматически добавлены в приватный канал!",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logging.error(f"Direct add failed for {purchase['user_id']}: {e}, trying invite link...")
+        if member.status != "administrator" or not member.can_invite_users:
+            raise Exception("⚠️ Бот не имеет прав администратора или прав на приглашение пользователей!")
         
-        if not direct_add_success:
-            try:
-                invite_link = await bot.create_chat_invite_link(
-                    chat_id=PRIVATE_CHANNEL_ID,
-                    member_limit=1,
-                    name=f"Подписка {purchase['username']}"
-                )
-                
-                await user_sender_bot.send_message(
-                    purchase['user_id'],
-                    f"✅ <b>Подписка активирована!</b>\n\n"
-                    f"Услуга: <b>{service['name']}</b>\n"
-                    f"Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n\n"
-                    f"Нажмите кнопку ниже, чтобы присоединиться к каналу:",
-                    parse_mode="HTML",
-                    reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[
-                        [types.InlineKeyboardButton(text="🔗 Присоединиться", url=invite_link.invite_link)]
-                    ])
-                )
-                
-                channel_added = True
-                await db.mark_user_added_to_channel(purchase['user_id'])
-            except Exception as e:
-                error_message = str(e)
-                logging.error(f"Failed to add user {purchase['user_id']} to channel: {e}")
+        # Создаем персональную одноразовую ссылку
+        invite = await bot.create_chat_invite_link(
+            chat_id=PRIVATE_CHANNEL_ID,
+            member_limit=1,  # Одноразовая ссылка
+            name=f"Подписка {purchase['username']}"
+        )
+        invite_link = invite.invite_link
+        
+        await db.mark_user_added_to_channel(purchase['user_id'])
+        logging.info(f"✅ Invite link created for user {purchase['user_id']}")
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to create invite link: {e}")
+        await callback.message.edit_text(
+            f"⚠️ Подписка активирована, но ошибка создания ссылки:\n{e}\n\n"
+            f"Проверьте права бота в канале через /start → Диагностика"
+        )
+        return
     
+    # 3. МГНОВЕННО ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ ПОЛЬЗОВАТЕЛЮ
+    try:
+        unit = service.get('duration_unit', 'days')
+        unit_text = {"minutes": "минут", "days": "дней", "months": "месяцев"}.get(unit, "дней")
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Присоединиться к каналу", url=invite_link)]
+        ])
+        
+        await user_sender_bot.send_message(
+            purchase['user_id'],
+            f"✅ <b>Подписка активирована!</b>\n\n"
+            f"📦 Услуга: <b>{service['name']}</b>\n"
+            f"⏱ Срок: {service['duration_days']} {unit_text}\n"
+            f"📅 Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n\n"
+            f"👇 Нажмите кнопку ниже, чтобы присоединиться к приватному каналу:",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        logging.info(f"✅ Notification sent to user {purchase['user_id']}")
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to send notification to user: {e}")
+        await callback.message.edit_text(
+            f"⚠️ Подписка активирована и ссылка создана, но не удалось отправить уведомление юзеру:\n{e}"
+        )
+        return
+    
+    # 4. УДАЛЯЕМ ЗАЯВКУ ИЗ БД
     await db.delete_pending_purchase(purchase_id)
     
-    if channel_added:
-        await callback.message.edit_text(
-            f"✅ Подписка активирована для @{purchase['username']}\n"
-            f"Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n"
-            f"Пользователь получил доступ к каналу"
-        )
-    else:
-        await callback.message.edit_text(
-            f"⚠️ Подписка активирована для @{purchase['username']}\n"
-            f"Действует до: {end_date.strftime('%d.%m.%Y %H:%M')}\n"
-            f"Ошибка добавления в канал: {error_message or 'Неизвестная ошибка'}"
-        )
+    # 5. УВЕДОМЛЯЕМ АДМИНА ОБ УСПЕХЕ
+    await callback.message.edit_text(
+        f"✅ <b>Подписка успешно активирована!</b>\n\n"
+        f"👤 Пользователь: @{purchase['username']}\n"
+        f"📦 Услуга: {service['name']}\n"
+        f"📅 До: {end_date.strftime('%d.%m.%Y %H:%M')}\n"
+        f"🔗 Персональная ссылка отправлена пользователю",
+        parse_mode="HTML"
+    )
+    
+    logging.info(f"✅ Purchase {purchase_id} approved successfully!")
 
 
 @dp.callback_query(F.data.startswith("reject_"))
@@ -775,7 +772,9 @@ async def reject_purchase(callback: types.CallbackQuery):
     try:
         await user_sender_bot.send_message(
             purchase['user_id'],
-            "❌ Ваша заявка на подписку отклонена администратором."
+            "❌ <b>Ваша заявка на подписку отклонена администратором.</b>\n\n"
+            "Если у вас есть вопросы, свяжитесь с поддержкой через /start → Связаться с админом",
+            parse_mode="HTML"
         )
     except Exception as e:
         logging.error(f"Failed to send rejection notice: {e}")
@@ -791,4 +790,23 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())append(f"❌ Ошибка получения info бота: {e}")
+    
+    try:
+        chat = await bot.get_chat(PRIVATE_CHANNEL_ID)
+        issues.append(f"✅ Канал найден: {chat.title}")
+        issues.append(f"   Тип: {chat.type}")
+    except Exception as e:
+        issues.append(f"❌ Ошибка доступа к каналу: {e}")
+    
+    try:
+        member = await bot.get_chat_member(PRIVATE_CHANNEL_ID, (await bot.get_me()).id)
+        issues.append(f"✅ Статус бота в канале: {member.status}")
+        
+        if member.status == "administrator":
+            perms = member.can_invite_users
+            issues.append(f"   Права на приглашение: {'✅' if perms else '❌'}")
+        else:
+            issues.append(f"   ⚠️ Бот не админ канала!")
+    except Exception as e:
+        issues.
